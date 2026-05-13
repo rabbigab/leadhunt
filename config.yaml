@@ -1,0 +1,55 @@
+scraping:
+  interval_minutes: 15        # intervalle entre cycles par compte (ne pas descendre sous 10)
+  posts_per_group: 25         # posts récents à analyser par groupe par cycle
+  delay_min_seconds: 3        # pause minimum entre deux groupes
+  delay_max_seconds: 10       # pause maximum entre deux groupes
+  no_scrape_hours:            # pause nocturne (heure locale du serveur)
+    start: 1
+    end: 7
+  cycle_jitter_minutes: 5     # variance aléatoire sur l'intervalle (anti-pattern)
+
+# Groupes surveillés — chaque groupe doit être assigné à un compte dans fb_accounts.groups_assigned
+# L'ID est la partie numérique de l'URL : facebook.com/groups/ID
+groups:
+  - id: "GROUPE_ID_1"
+    name: "Francophones Tel Aviv"
+    url: "https://www.facebook.com/groups/GROUPE_ID_1"
+    active: true
+  - id: "GROUPE_ID_2"
+    name: "Francophones Israël"
+    url: "https://www.facebook.com/groups/GROUPE_ID_2"
+    active: true
+
+keywords:
+  active_categories:
+    - plomberie
+    - electricite
+    - serrurerie
+    - peinture
+    - bricolage
+    - osteopathie
+    - kine
+    - traiteur
+    - demenagement
+
+  # Patterns négatifs : si présents dans le post → ignoré (faux positif)
+  negative_patterns:
+    - "je suis plombier"
+    - "je suis électricien"
+    - "je suis électricienne"
+    - "je suis ostéopathe"
+    - "je suis kinésithérapeute"
+    - "je suis serrurier"
+    - "je propose mes services"
+    - "je propose mes prestations"
+    - "offre d'emploi"
+    - "offre emploi"
+    - "recrutement"
+    - "on recrute"
+    - "nous recrutons"
+    - "cherche emploi"
+    - "cherche travail"
+    - "à vendre"
+    - "a vendre"
+    - "vend "
+    - "vends "
