@@ -22,6 +22,22 @@ add-account:
 add-groups:
 	$(PYTHON) scripts/add_groups.py
 
+export:
+	$(PYTHON) scripts/export_leads.py
+
+export-week:
+	$(PYTHON) scripts/export_leads.py --days 7
+
+test-selectors:
+	@read -p "ID du groupe Facebook : " gid; \
+	$(PYTHON) scripts/test_selectors.py --group $$gid --visible
+
+simulate:
+	$(PYTHON) scripts/simulate.py
+
+simulate-dry:
+	$(PYTHON) scripts/simulate.py --dry-run
+
 # ── Dashboard ─────────────────────────────────────────────────────
 status:
 	$(PYTHON) scripts/status.py
@@ -66,5 +82,10 @@ help:
 	@echo "  make test          — Lancer les tests unitaires"
 	@echo "  make run           — Démarrer le scraper (headless)"
 	@echo "  make run-visible   — Premier login (navigateur visible)"
+	@echo "  make simulate      — Tester le pipeline sans Facebook"
+	@echo "  make simulate-dry  — Tester sans écrire en DB"
+	@echo "  make export        — Exporter les leads du jour (CSV)"
+	@echo "  make export-week   — Exporter les leads des 7 derniers jours"
+	@echo "  make test-selectors — Tester les sélecteurs Facebook (debug)"
 	@echo "  make logs          — Suivre les logs systemd"
 	@echo ""
