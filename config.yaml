@@ -22,15 +22,36 @@ groups:
 
 keywords:
   active_categories:
+    # Métiers du bâtiment
     - plomberie
     - electricite
     - serrurerie
     - peinture
     - bricolage
+    - jardinage
+    - nettoyage
+    # Santé / bien-être
     - osteopathie
     - kine
+    - medecin
+    - dentiste
+    - coach
+    # Famille / domicile
+    - garde_enfants
+    - cours_particuliers
+    - aide_domicile
+    # Événementiel / services
     - traiteur
+    - photographe
     - demenagement
+    # Professions libérales
+    - avocat
+    - comptable
+    - traduction
+    - informatique
+    # Beauté / animaux
+    - esthetique
+    - animaux
 
   # Patterns négatifs : si présents dans le post → ignoré (faux positif)
   negative_patterns:

@@ -253,6 +253,8 @@ async def main() -> None:
 
     health_monitor = HealthMonitor(account_manager, notifier)
 
+    notifier.set_db(db)
+    notifier.start_callback_listener()
     await notifier.send_startup_message()
     logger.info(
         f"Démarrage de {len(active_accounts)} worker(s) + "
