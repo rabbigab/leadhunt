@@ -2,14 +2,8 @@
 main.py — Userbot Telethon : écoute un groupe crypto, détecte les signaux via Claude API,
 reformate en français et redistribue sur deux canaux.
 
-Canaux :
-  SOURCE  : -1001791805388  (groupe écouté)
-  PRIVÉ   : -1003818214932  (100 % des signaux détectés)
-  PUBLIC  : -1003839179079  (1 signal sur 3)
-
-Prérequis :
-  - Fichier userbot.session présent (généré par auth.py)
-  - Variables d'environnement chargées depuis .env
+Session : chargée depuis la variable d'environnement SESSION_STRING (StringSession Telethon).
+          Générez-la avec convert_session.py après avoir exécuté auth.py en local.
 """
 
 import asyncio
@@ -21,6 +15,7 @@ from itertools import count
 import anthropic
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.tl.types import Message
 
 # ---------------------------------------------------------------------------
@@ -36,7 +31,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-_REQUIRED_ENV = ("API_ID", "API_HASH", "BOT_TOKEN", "ANTHROPIC_API_KEY")
+_REQUIRED_ENV = (
+    "API_ID", "API_HASH", "BOT_TOKEN", "ANTHROPIC_API_KEY", "SESSION_STRING",
+    "SOURCE_GROUP_ID", "PRIVATE_CHANNEL_ID", "PUBLIC_CHANNEL_ID",
+)
 for _var in _REQUIRED_ENV:
     if not os.environ.get(_var):
         sys.exit(f"Erreur : variable d'environnement manquante : {_var}")
@@ -45,10 +43,11 @@ API_ID: int = int(os.environ["API_ID"])
 API_HASH: str = os.environ["API_HASH"]
 BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 ANTHROPIC_API_KEY: str = os.environ["ANTHROPIC_API_KEY"]
+SESSION_STRING: str = os.environ["SESSION_STRING"]
 
-SOURCE_GROUP: int = -1001791805388
-CHANNEL_PRIVATE: int = -1003818214932
-CHANNEL_PUBLIC: int = -1003839179079
+SOURCE_GROUP: int = int(os.environ["SOURCE_GROUP_ID"])
+CHANNEL_PRIVATE: int = int(os.environ["PRIVATE_CHANNEL_ID"])
+CHANNEL_PUBLIC: int = int(os.environ["PUBLIC_CHANNEL_ID"])
 
 CLAUDE_MODEL: str = "claude-sonnet-4-6"
 
@@ -60,8 +59,8 @@ _public_modulo: int = 3
 # Clients
 # ---------------------------------------------------------------------------
 
-userbot = TelegramClient("userbot", API_ID, API_HASH)
-bot = TelegramClient("bot", API_ID, API_HASH)
+userbot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+bot = TelegramClient(StringSession(), API_ID, API_HASH)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ---------------------------------------------------------------------------
@@ -160,7 +159,10 @@ async def main() -> None:
 
     me = await userbot.get_me()
     log.info("Userbot connecté : %s (@%s)", me.first_name, me.username)
-    log.info("Écoute du groupe %d — en attente de messages…", SOURCE_GROUP)
+    log.info(
+        "Écoute du groupe %d → privé %d / public %d",
+        SOURCE_GROUP, CHANNEL_PRIVATE, CHANNEL_PUBLIC,
+    )
 
     await userbot.run_until_disconnected()
 

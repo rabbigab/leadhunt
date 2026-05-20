@@ -6,3 +6,6 @@ python-dotenv==1.0.1
 schedule==1.2.2
 pytest==8.2.2
 pytest-asyncio==0.23.7
+# telegram listener
+anthropic>=0.30.0
+telethon>=1.36.0
