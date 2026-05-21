@@ -75,6 +75,10 @@ ALL_CHANNELS    = [CHANNEL_PRIVATE, CHANNEL_PUBLIC]
 
 CLAUDE_MODEL = "claude-sonnet-4-6"
 
+# Blocklist : termes séparés par virgules, insensibles à la casse
+_raw_blocklist = os.environ.get("SOURCE_BLOCKLIST", "")
+SOURCE_BLOCKLIST: list[str] = [t.strip().lower() for t in _raw_blocklist.split(",") if t.strip()]
+
 DISCLAIMER = (
     "📌 *Avis important*\n\n"
     "Les signaux et analyses publiés ici sont partagés à titre informatif uniquement.\n"
@@ -92,6 +96,7 @@ bot     = TelegramClient(StringSession(), API_ID, API_HASH)
 claude  = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 _http_session: Optional[aiohttp.ClientSession] = None
+_dedup_lock = asyncio.Lock()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Prompts Claude
@@ -103,7 +108,12 @@ Réponds uniquement par un seul mot parmi : signal, analyse, autre.
 
 - signal  : contient des zones d'entrée, targets (TP) et/ou stop-loss. Appel direct à trader.
 - analyse : commentaire de marché, vue macro, résultat de trade, opinion sur une crypto.
-- autre   : lien seul, image sans texte pertinent, publicité, message hors-sujet.\
+            Contenu factuel et prospectif uniquement.
+- autre   : lien seul, image sans texte pertinent, publicité, message hors-sujet,
+            ou tout message principalement auto-promotionnel — vantardise sur des calls passés,
+            attribution de performance ("nous avions prévu", "notre analyse a touché le TP",
+            "ceux qui nous suivent", "communiqué en amont", "notre track record",
+            "la performance parle d'elle-même", "abonnez-vous", "rejoignez notre groupe").\
 """
 
 _SIGNAL_SYS = """\
@@ -121,7 +131,10 @@ Règles :
 - Conserve TOUS les chiffres, pourcentages et paires.
 - Réécris complètement le style — jamais de traduction mot-à-mot.
 - Concis, lisible sur mobile.
-- Aucun avertissement ni commentaire personnel.\
+- Aucun avertissement ni commentaire personnel.
+- Interdit : toute formulation auto-référentielle ("nous avions signalé", "notre call",
+  "ceux qui nous suivent", "comme prévu", "notre analyse"), tout "nous" ou "je" qui
+  s'attribue un historique de calls. Formuler de façon neutre et impersonnelle.\
 """
 
 _ANALYSE_SYS = """\
@@ -130,7 +143,10 @@ Réécris ce contenu en français comme si c'était une analyse originale rédig
 Conserve les idées clés, les faits chiffrés et les cryptos mentionnées.
 Ne traduis pas littéralement — reformule entièrement : style fluide, direct, professionnel.
 Pas de bullet points forcés, pas d'avertissement, pas de titre inutile.
-Longueur proportionnelle au contenu source.\
+Longueur proportionnelle au contenu source.
+Interdit : toute auto-référence à des calls passés, à un groupe, à un historique de performance,
+ou tout "nous"/"je" qui s'attribue une prévision. Conserver uniquement le contenu de
+marché factuel et prospectif, en formulation neutre et impersonnelle.\
 """
 
 _EXTRACTION_SYS = """\
@@ -161,14 +177,65 @@ class MessageType(str, Enum):
     AUTRE   = "autre"
 
 
+# ── Retry avec backoff exponentiel ────────────────────────────────────────────
+
+async def _retry(coro_fn, retries: int = 3, base_delay: float = 1.0):
+    last_exc: Exception = RuntimeError("no attempts")
+    for attempt in range(retries):
+        try:
+            return await coro_fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                log.warning(
+                    "Tentative %d/%d échouée (%s) — retry dans %.0f s",
+                    attempt + 1, retries, exc, delay,
+                )
+                await asyncio.sleep(delay)
+    log.error("Échec définitif après %d tentatives : %s", retries, last_exc)
+    raise last_exc
+
+
+async def _send_with_retry(ch: int, text: str, **kwargs) -> None:
+    await _retry(lambda: bot.send_message(ch, text, **kwargs))
+
+
+# ── Blocklist helpers ─────────────────────────────────────────────────────────
+
+def _blocklist_hit(text: str) -> Optional[str]:
+    """Retourne le premier terme bloqué trouvé dans text, ou None."""
+    lower = text.lower()
+    for term in SOURCE_BLOCKLIST:
+        if term in lower:
+            return term
+    return None
+
+
+def _scrub_blocklist(text: str) -> str:
+    """Retire les termes de la blocklist du texte (insensible à la casse)."""
+    for term in SOURCE_BLOCKLIST:
+        text = re.sub(re.escape(term), "", text, flags=re.IGNORECASE)
+    return re.sub(r" {2,}", " ", text).strip()
+
+
+def _is_incoherent(text: str) -> bool:
+    """Vrai si le texte est trop court pour être publié après scrubbing."""
+    return len(text.strip()) < 30
+
+
+# ── Claude calls ──────────────────────────────────────────────────────────────
+
 async def _claude(system: str, prompt: str, max_tokens: int = 1024) -> str:
-    resp = await claude.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return resp.content[0].text.strip()
+    async def _call():
+        resp = await claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text.strip()
+    return await _retry(_call)
 
 
 async def classify(text: str) -> MessageType:
@@ -219,15 +286,26 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
     if not text:
         return
 
-    # Déduplication
-    if await db.is_processed(message_id, text):
-        log.info("Message #%d déjà traité — ignoré.", message_id)
-        return
-    await db.mark_processed(message_id, text)
+    # Layer 1 — blocklist sur le texte source brut (déterministe, avant tout appel)
+    if SOURCE_BLOCKLIST:
+        hit = _blocklist_hit(text)
+        if hit:
+            log.info("Message #%d ignoré (blocklist : %r).", message_id, hit)
+            return
+
+    # Déduplication atomique : le lock garantit qu'un seul handler exécute
+    # simultanément le check + mark, éliminant la race condition sur les doublons.
+    # Le marquage est immédiat (avant tout traitement) pour bloquer tout concurrent.
+    async with _dedup_lock:
+        if await db.is_processed(message_id, text):
+            log.info("Message #%d déjà traité — ignoré.", message_id)
+            return
+        await db.mark_processed(message_id, text)
 
     log.info("Message #%d reçu (%d car.)", message_id, len(text))
 
     try:
+        # Layer 2 — classification LLM (inclut détection auto-promo dans "autre")
         msg_type = await classify(text)
         log.info("Classification : %s", msg_type.value)
 
@@ -268,14 +346,21 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
         else:  # ANALYSE
             formatted = await rewrite_analysis(text)
 
+        # Layer 3 — scrub déterministe sur la sortie reformatée
+        if SOURCE_BLOCKLIST:
+            formatted = _scrub_blocklist(formatted)
+            if _is_incoherent(formatted):
+                log.warning("Message #%d abandonné : texte vide/incohérent après scrub.", message_id)
+                return
+
         for ch in ALL_CHANNELS:
-            await bot.send_message(ch, formatted)
+            await _send_with_retry(ch, formatted)
         log.info("Publié sur %d canaux (%s).", len(ALL_CHANNELS), msg_type.value)
 
     except anthropic.APIError as exc:
-        log.error("Erreur Claude API : %s", exc)
+        log.error("Erreur Claude API (message #%d) : %s", message_id, exc)
     except Exception as exc:
-        log.error("Erreur inattendue : %s", exc, exc_info=True)
+        log.error("Erreur inattendue (message #%d) : %s", message_id, exc, exc_info=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point
