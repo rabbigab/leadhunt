@@ -1,297 +1,398 @@
-"""LeadHunt — runner principal multi-comptes.
+"""
+main.py — Userbot Telethon + suivi de trades en temps réel via Binance klines.
 
-Architecture :
-- 1 worker asyncio par compte Facebook actif (4 max)
-- Chaque worker scrape ses groupes assignés en boucle
-- InteractionBot tourne à chaque session pour simuler un humain
-- HealthMonitor surveille les bans et déclenche les basculements
-- WarmupSequencer gère les comptes en période de chauffe
+Pipeline par message :
+  1. Déduplication par message_id + hash texte (SQLite)
+  2. Classification Claude → signal | analyse | autre
+  3. signal  : reformatage FR + extraction JSON → suivi Binance si paire trouvée
+     analyse : réécriture FR originale
+     autre   : ignoré
+  4. Publication sur canal privé ET canal public
+
+Modules complémentaires :
+  db.py          — persistance SQLite (Railway Volume /data ou local)
+  binance_api.py — résolution symboles + klines
+  tracker.py     — polling trades toutes les 5 min
+  scheduler.py   — rapport hebdomadaire lundi 09:00 UTC
+
+Session Telethon chargée depuis SESSION_STRING (StringSession).
+Générer avec convert_session.py après auth.py en local.
 """
 
 import asyncio
+import json
 import logging
-import logging.handlers
-import random
+import os
+import re
 import sys
+from enum import Enum
+from typing import Optional
 
-from scraper.accounts.health_monitor import HealthMonitor
-from scraper.accounts.manager import AccountManager, AccountRecord
-from scraper.accounts.warmup import WarmupSequencer
-from scraper.config.settings import settings, load_config
-from scraper.database.client import SupabaseClient
-from scraper.detection.deduplication import Deduplicator
-from scraper.detection.keyword_engine import KeywordEngine
-from scraper.facebook.group_reader import GroupReader
-from scraper.facebook.interaction_bot import InteractionBot
-from scraper.facebook.session import FacebookSession
-from scraper.notifications.telegram import TelegramNotifier
+import aiohttp
+import anthropic
+from dotenv import load_dotenv
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.tl.types import Message
+
+import binance_api
+import db
+import scheduler
+import tracker
+import x_poster
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+_REQUIRED_ENV = (
+    "API_ID", "API_HASH", "BOT_TOKEN", "ANTHROPIC_API_KEY", "SESSION_STRING",
+    "SOURCE_GROUP_ID", "PRIVATE_CHANNEL_ID", "PUBLIC_CHANNEL_ID",
+)
+for _var in _REQUIRED_ENV:
+    if not os.environ.get(_var):
+        sys.exit(f"Erreur : variable d'environnement manquante : {_var}")
+
+API_ID            = int(os.environ["API_ID"])
+API_HASH          = os.environ["API_HASH"]
+BOT_TOKEN         = os.environ["BOT_TOKEN"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+SESSION_STRING    = os.environ["SESSION_STRING"]
+
+SOURCE_GROUP    = int(os.environ["SOURCE_GROUP_ID"])
+CHANNEL_PRIVATE = int(os.environ["PRIVATE_CHANNEL_ID"])
+CHANNEL_PUBLIC  = int(os.environ["PUBLIC_CHANNEL_ID"])
+ALL_CHANNELS    = [CHANNEL_PRIVATE, CHANNEL_PUBLIC]
+
+CLAUDE_MODEL = "claude-sonnet-4-6"
+
+# Blocklist : termes séparés par virgules, insensibles à la casse
+_raw_blocklist = os.environ.get("SOURCE_BLOCKLIST", "")
+SOURCE_BLOCKLIST: list[str] = [t.strip().lower() for t in _raw_blocklist.split(",") if t.strip()]
+
+DISCLAIMER = (
+    "📌 *Avis important*\n\n"
+    "Les signaux et analyses publiés ici sont partagés à titre informatif uniquement.\n"
+    "Ils ne constituent *pas* un conseil en investissement.\n\n"
+    "*Faites vos propres recherches (DYOR) avant toute décision financière.*\n\n"
+    "_Trading crypto = risque élevé de perte en capital._"
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Clients
+# ──────────────────────────────────────────────────────────────────────────────
+
+userbot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+bot     = TelegramClient(StringSession(), API_ID, API_HASH)
+claude  = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+_http_session: Optional[aiohttp.ClientSession] = None
+_dedup_lock = asyncio.Lock()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Prompts Claude
+# ──────────────────────────────────────────────────────────────────────────────
+
+_CLASSIFICATION_SYS = """\
+Tu es un classificateur de messages Telegram dans un groupe crypto.
+Réponds uniquement par un seul mot parmi : signal, analyse, autre.
+
+- signal  : contient des zones d'entrée, targets (TP) et/ou stop-loss. Appel direct à trader.
+- analyse : commentaire de marché, vue macro, résultat de trade, opinion sur une crypto.
+            Contenu factuel et prospectif uniquement.
+- autre   : lien seul, image sans texte pertinent, publicité, message hors-sujet,
+            ou tout message principalement auto-promotionnel — vantardise sur des calls passés,
+            attribution de performance ("nous avions prévu", "notre analyse a touché le TP",
+            "ceux qui nous suivent", "communiqué en amont", "notre track record",
+            "la performance parle d'elle-même", "abonnez-vous", "rejoignez notre groupe").\
+"""
+
+_SIGNAL_SYS = """\
+Tu es un expert en trading crypto francophone.
+Reformate ce signal en français avec la structure suivante (adapte selon les infos disponibles) :
+📌 Paire
+📈 Direction
+🎯 Entrée / Zone d'entrée
+🎯 Targets (TP1, TP2, TP3…)
+🛑 Stop-loss
+⏱ Timeframe (si mentionné)
+📝 Note (si info complémentaire utile)
+
+Règles :
+- Conserve TOUS les chiffres, pourcentages et paires.
+- Réécris complètement le style — jamais de traduction mot-à-mot.
+- Concis, lisible sur mobile.
+- Aucun avertissement ni commentaire personnel.
+- Interdit : toute formulation auto-référentielle ("nous avions signalé", "notre call",
+  "ceux qui nous suivent", "comme prévu", "notre analyse"), tout "nous" ou "je" qui
+  s'attribue un historique de calls. Formuler de façon neutre et impersonnelle.\
+"""
+
+_ANALYSE_SYS = """\
+Tu es un analyste crypto francophone.
+Réécris ce contenu en français comme si c'était une analyse originale rédigée par toi.
+Conserve les idées clés, les faits chiffrés et les cryptos mentionnées.
+Ne traduis pas littéralement — reformule entièrement : style fluide, direct, professionnel.
+Pas de bullet points forcés, pas d'avertissement, pas de titre inutile.
+Longueur proportionnelle au contenu source.
+Interdit : toute auto-référence à des calls passés, à un groupe, à un historique de performance,
+ou tout "nous"/"je" qui s'attribue une prévision. Conserver uniquement le contenu de
+marché factuel et prospectif, en formulation neutre et impersonnelle.\
+"""
+
+_EXTRACTION_SYS = """\
+Tu es un extracteur de données structurées pour des signaux de trading crypto.
+Retourne UNIQUEMENT un objet JSON valide, sans markdown ni explication.
+
+Champs :
+- asset     : ticker de la crypto en majuscules, sans quote (ex: "BTC", "JUP")
+- direction : "long" ou "short"
+- entry1    : premier prix d'entrée (float)
+- entry2    : deuxième prix d'entrée ou null (float|null)
+- targets   : take-profits ordonnés [TP1, TP2, …] (array of float)
+- stop_loss : prix du stop-loss (float)
+
+Si un champ requis (asset, direction, entry1, targets, stop_loss) est absent ou incertain,
+retourne : {"uncertain": true}
+
+Retourne UNIQUEMENT le JSON.\
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+class MessageType(str, Enum):
+    SIGNAL  = "signal"
+    ANALYSE = "analyse"
+    AUTRE   = "autre"
 
 
-def setup_logging() -> None:
-    settings.LOGS_DIR.mkdir(exist_ok=True)
-    root = logging.getLogger()
-    root.setLevel(getattr(logging, settings.LOG_LEVEL, logging.INFO))
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
-    root.addHandler(ch)
-
-    fh = logging.handlers.RotatingFileHandler(
-        settings.LOGS_DIR / "scraper.log",
-        maxBytes=10 * 1024 * 1024,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    fh.setFormatter(fmt)
-    root.addHandler(fh)
-
-
-logger = logging.getLogger(__name__)
-
-
-def is_in_no_scrape_window(config: dict) -> bool:
-    no_scrape = config.get("scraping", {}).get("no_scrape_hours", {})
-    if not no_scrape:
-        return False
-    start = no_scrape.get("start", 1)
-    end = no_scrape.get("end", 7)
-    hour = __import__("datetime").datetime.now().hour
-    return start <= hour < end if start <= end else (hour >= start or hour < end)
-
-
-async def run_account_cycle(
-    account: AccountRecord,
-    config: dict,
-    db: SupabaseClient,
-    dedup: Deduplicator,
-    keyword_engine: KeywordEngine,
-    notifier: TelegramNotifier,
-    account_manager: AccountManager,
-) -> tuple[int, int, int, list[str]]:
-    """Cycle de scraping complet pour un compte. Retourne (groups, posts, leads, errors)."""
-    scraping_cfg = config.get("scraping", {})
-    delay_min = scraping_cfg.get("delay_min_seconds", 3)
-    delay_max = scraping_cfg.get("delay_max_seconds", 10)
-    posts_per_group = scraping_cfg.get("posts_per_group", 25)
-
-    proxy = settings.get_next_proxy()
-    fb_session = FacebookSession(proxy_url=proxy, account_id=account.id)
-    await fb_session.start()
-
-    if not await fb_session.login():
-        logger.error(f"[{account.label}] Impossible de se connecter — cycle ignoré")
-        account_manager.log_health_event(account.id, "login_fail")
-        await fb_session.close()
-        return 0, 0, 0, ["login_fail"]
-
-    interaction_bot = InteractionBot(fb_session, account.id)
-
-    # Warmup feed au début de chaque session (comportement humain)
-    interactions = await interaction_bot.run_feed_warmup()
-    logger.debug(f"[{account.label}] {interactions} interactions feed")
-
-    reader = GroupReader(fb_session)
-    groups_scraped = posts_checked = leads_found = 0
-    errors: list[str] = []
-
-    # Groupes assignés à ce compte + groupes actifs dans config
-    config_groups = {g["id"]: g for g in config.get("groups", []) if g.get("active")}
-    my_groups = [config_groups[gid] for gid in account.groups_assigned if gid in config_groups]
-
-    for group in my_groups:
+async def _retry(coro_fn, retries: int = 3, base_delay: float = 1.0):
+    last_exc: Exception = RuntimeError("no attempts")
+    for attempt in range(retries):
         try:
-            posts = await reader.fetch_recent_posts(
-                group["id"], group["name"], group["url"], limit=posts_per_group
-            )
-            groups_scraped += 1
-            posts_checked += len(posts)
-
-            for post in posts:
-                if dedup.is_known(post.fb_post_id):
-                    continue
-                if db.post_id_exists(post.fb_post_id):
-                    dedup.mark_known(post.fb_post_id)
-                    continue
-
-                match = keyword_engine.match(post.content)
-                dedup.mark_known(post.fb_post_id)
-
-                if match is None:
-                    continue
-
-                logger.info(
-                    f"[{account.label}] Lead [{match.category}] "
-                    f"confiance {int(match.confidence * 100)}% — '{post.content[:60]}'"
+            return await coro_fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                log.warning(
+                    "Tentative %d/%d échouée (%s) — retry dans %.0f s",
+                    attempt + 1, retries, exc, delay,
                 )
-                db.save_lead(post, match)
-                notified = await notifier.send(post, match)
-                if notified:
-                    db.mark_notified(post.fb_post_id)
-                    account_manager.record_interaction(account.id, "like", post.post_url, "lead_detected")
-                leads_found += 1
-
-            # Interaction occasionnelle dans le groupe (anti-ban)
-            await interaction_bot.maybe_interact_in_group(fb_session.page, group["id"])
-
-        except Exception as e:
-            err = f"{group['name']}: {e}"
-            logger.error(f"[{account.label}] {err}")
-            errors.append(err)
-
-        # Pause humaine entre groupes
-        await asyncio.sleep(random.uniform(delay_min, delay_max))
-
-    await fb_session.close()
-    return groups_scraped, posts_checked, leads_found, errors
+                await asyncio.sleep(delay)
+    log.error("Échec définitif après %d tentatives : %s", retries, last_exc)
+    raise last_exc
 
 
-async def run_warming_sessions(
-    account_manager: AccountManager,
-    config: dict,
-    notifier: TelegramNotifier,
-) -> None:
-    """Lance les sessions de warming pour les comptes en phase de chauffe."""
-    target_group_ids = [g["id"] for g in config.get("groups", []) if g.get("active")]
-
-    for acc in account_manager.warming_accounts():
-        if acc.warming_started_at is None:
-            continue
-        try:
-            fb_session = FacebookSession(account_id=acc.id)
-            await fb_session.start()
-            if await fb_session.login():
-                sequencer = WarmupSequencer(fb_session, acc.id, acc.warming_started_at)
-                await sequencer.run_daily_warming_session(target_group_ids)
-            await fb_session.close()
-        except Exception as e:
-            logger.error(f"[{acc.label}] Erreur session warming : {e}")
+async def _send_with_retry(ch: int, text: str, **kwargs) -> None:
+    await _retry(lambda: bot.send_message(ch, text, **kwargs))
 
 
-async def worker(
-    account: AccountRecord,
-    config: dict,
-    db: SupabaseClient,
-    dedup: Deduplicator,
-    keyword_engine: KeywordEngine,
-    notifier: TelegramNotifier,
-    account_manager: AccountManager,
-    health_monitor: HealthMonitor,
-    stop_event: asyncio.Event,
-) -> None:
-    """Worker dédié à un compte Facebook. Tourne jusqu'à stop_event."""
-    interval_minutes = config.get("scraping", {}).get("interval_minutes", 15)
-    jitter_minutes = config.get("scraping", {}).get("cycle_jitter_minutes", 5)
-    label = account.label
+def _blocklist_hit(text: str) -> Optional[str]:
+    lower = text.lower()
+    for term in SOURCE_BLOCKLIST:
+        if term in lower:
+            return term
+    return None
 
-    logger.info(f"[{label}] Worker démarré — {len(account.groups_assigned)} groupes")
 
-    while not stop_event.is_set():
-        if is_in_no_scrape_window(config):
-            logger.debug(f"[{label}] Pause nocturne active")
-            await asyncio.sleep(300)
-            continue
+def _scrub_blocklist(text: str) -> str:
+    for term in SOURCE_BLOCKLIST:
+        text = re.sub(re.escape(term), "", text, flags=re.IGNORECASE)
+    return re.sub(r" {2,}", " ", text).strip()
 
-        # Recharger le statut du compte depuis DB (peut avoir changé si banni)
-        account_manager.load()
-        updated = next((a for a in account_manager.active_accounts() if a.id == account.id), None)
-        if updated is None:
-            logger.warning(f"[{label}] Compte retiré des actifs — worker arrêté")
-            break
-        account = updated
 
-        logger.info(f"[{label}] Début du cycle")
-        start = asyncio.get_event_loop().time()
+def _is_incoherent(text: str) -> bool:
+    return len(text.strip()) < 30
 
-        groups, posts, leads, errors = await run_account_cycle(
-            account, config, db, dedup, keyword_engine, notifier, account_manager
+
+async def _claude(system: str, prompt: str, max_tokens: int = 1024) -> str:
+    async def _call():
+        resp = await claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
         )
-
-        elapsed = asyncio.get_event_loop().time() - start
-        logger.info(f"[{label}] Cycle OK en {elapsed:.0f}s — {groups} groupes, {posts} posts, {leads} leads")
-
-        await health_monitor.check_after_cycle(account, posts, leads, errors)
-        db.save_scrape_session(groups, posts, leads, errors)
-
-        # Attendre le prochain cycle avec jitter
-        jitter = random.uniform(0, jitter_minutes * 60)
-        wait = max(0, interval_minutes * 60 - elapsed) + jitter
-        logger.info(f"[{label}] Prochain cycle dans {wait / 60:.1f} min")
-        await asyncio.sleep(wait)
+        return resp.content[0].text.strip()
+    return await _retry(_call)
 
 
-async def main() -> None:
-    setup_logging()
-    logger.info("=== LeadHunt démarrage ===")
+async def classify(text: str) -> MessageType:
+    raw  = await _claude(_CLASSIFICATION_SYS, f"Message :\n{text}", max_tokens=10)
+    word = raw.strip().lower().split()[0] if raw.strip() else "autre"
+    try:
+        return MessageType(word)
+    except ValueError:
+        return MessageType.AUTRE
 
-    config = load_config()
-    db = SupabaseClient()
-    notifier = TelegramNotifier()
 
-    # Charger les mots-clés depuis DB
-    keyword_rows = db.get_keyword_categories()
-    negative_patterns = config.get("keywords", {}).get("negative_patterns", [])
-    keyword_engine = KeywordEngine.from_db_rows(keyword_rows, negative_patterns)
-    logger.info(f"Moteur de mots-clés : {len(keyword_rows)} catégories")
+async def reformat_signal(text: str) -> str:
+    return await _claude(_SIGNAL_SYS, f"Signal à reformater :\n{text}")
 
-    # Déduplicateur partagé entre tous les workers
-    dedup = Deduplicator()
-    dedup.preload(db.get_recent_post_ids(limit=5000))
 
-    # Charger les comptes
-    account_manager = AccountManager(db._client)
-    account_manager.load()
+async def rewrite_analysis(text: str) -> str:
+    return await _claude(_ANALYSE_SYS, f"Contenu à réécrire :\n{text}")
 
-    active_accounts = account_manager.active_accounts()
-    if not active_accounts:
-        logger.critical(
-            "Aucun compte Facebook actif trouvé dans Supabase.\n"
-            "Insère au moins 1 ligne dans fb_accounts avec status='active' "
-            "et groups_assigned contenant les IDs de groupes à surveiller."
-        )
-        sys.exit(1)
 
-    health_monitor = HealthMonitor(account_manager, notifier)
+async def extract_signal(text: str) -> Optional[dict]:
+    raw = await _claude(_EXTRACTION_SYS, f"Signal :\n{text}")
+    raw = re.sub(r"```(?:json)?", "", raw).strip()
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if data.get("uncertain"):
+        return None
+    required = ("asset", "direction", "entry1", "targets", "stop_loss")
+    if not all(data.get(k) is not None for k in required):
+        return None
+    if data["direction"] not in ("long", "short"):
+        return None
+    if not isinstance(data["targets"], list) or not data["targets"]:
+        return None
+    return data
 
-    notifier.set_db(db)
-    notifier.start_callback_listener()
-    await notifier.send_startup_message()
-    logger.info(
-        f"Démarrage de {len(active_accounts)} worker(s) + "
-        f"{len(account_manager.warming_accounts())} compte(s) en warming"
-    )
+# ──────────────────────────────────────────────────────────────────────────────
+# Message handler
+# ──────────────────────────────────────────────────────────────────────────────
 
-    stop_event = asyncio.Event()
+@userbot.on(events.NewMessage(chats=SOURCE_GROUP))
+async def handle_new_message(event: events.NewMessage.Event) -> None:
+    message: Message = event.message
+    text:       str  = (message.text or "").strip()
+    message_id: int  = message.id
 
-    # Lancer 1 worker par compte actif en parallèle
-    worker_tasks = [
-        asyncio.create_task(
-            worker(acc, config, db, dedup, keyword_engine, notifier, account_manager, health_monitor, stop_event)
-        )
-        for acc in active_accounts
-    ]
+    if not text:
+        return
 
-    # Tâche de warming (tourne 1x par heure, sessions courtes)
-    async def warming_loop():
-        while not stop_event.is_set():
-            await asyncio.sleep(3600)  # 1 fois par heure
-            if not is_in_no_scrape_window(config):
-                await run_warming_sessions(account_manager, config, notifier)
-                await health_monitor.check_warming_promotions()
+    # Layer 1 — blocklist sur le texte source brut
+    if SOURCE_BLOCKLIST:
+        hit = _blocklist_hit(text)
+        if hit:
+            log.info("Message #%d ignoré (blocklist : %r).", message_id, hit)
+            return
 
-    warming_task = asyncio.create_task(warming_loop())
+    # Déduplication atomique
+    async with _dedup_lock:
+        if await db.is_processed(message_id, text):
+            log.info("Message #%d déjà traité — ignoré.", message_id)
+            return
+        await db.mark_processed(message_id, text)
+
+    log.info("Message #%d reçu (%d car.)", message_id, len(text))
 
     try:
-        await asyncio.gather(*worker_tasks, warming_task)
-    except KeyboardInterrupt:
-        logger.info("Arrêt demandé (Ctrl+C)")
-        stop_event.set()
-    except Exception as e:
-        logger.critical(f"Erreur fatale : {e}", exc_info=True)
-        await notifier.send_error_alert(f"💥 Erreur fatale LeadHunt : {e}")
-        stop_event.set()
+        # Layer 2 — classification LLM
+        msg_type = await classify(text)
+        log.info("Classification : %s", msg_type.value)
 
-    logger.info("LeadHunt arrêté")
+        if msg_type is MessageType.AUTRE:
+            log.info("Ignoré.")
+            return
+
+        if msg_type is MessageType.SIGNAL:
+            formatted = await reformat_signal(text)
+            suffix    = ""
+
+            signal_data = await extract_signal(text)
+            if signal_data and _http_session:
+                symbol = await binance_api.resolve_symbol(
+                    signal_data["asset"], _http_session
+                )
+                if symbol:
+                    trade_id = await db.add_trade(
+                        source_message_id=message_id,
+                        asset=signal_data["asset"].upper(),
+                        symbol=symbol,
+                        direction=signal_data["direction"],
+                        entry1=float(signal_data["entry1"]),
+                        entry2=float(signal_data["entry2"]) if signal_data.get("entry2") else None,
+                        targets=[float(t) for t in signal_data["targets"]],
+                        stop_loss=float(signal_data["stop_loss"]),
+                    )
+                    suffix = f"\n\n📡 _Suivi actif sur {symbol} (trade #{trade_id})_"
+                    log.info("Trade #%d créé — %s %s.", trade_id, signal_data["direction"].upper(), symbol)
+                else:
+                    suffix = f"\n\n📡 _Suivi non disponible ({signal_data['asset']} introuvable sur Binance)_"
+                    log.info("Symbole %s introuvable sur Binance.", signal_data["asset"])
+            elif not signal_data:
+                log.info("Extraction incertaine — signal posté sans suivi.")
+
+            formatted += suffix
+
+        else:  # ANALYSE
+            formatted = await rewrite_analysis(text)
+
+        # Layer 3 — scrub déterministe sur la sortie
+        if SOURCE_BLOCKLIST:
+            formatted = _scrub_blocklist(formatted)
+            if _is_incoherent(formatted):
+                log.warning("Message #%d abandonné : texte vide/incohérent après scrub.", message_id)
+                return
+
+        for ch in ALL_CHANNELS:
+            await _send_with_retry(ch, formatted)
+        log.info("Publié sur %d canaux (%s).", len(ALL_CHANNELS), msg_type.value)
+
+        asyncio.create_task(
+            x_poster.post_to_x(formatted, claude, SOURCE_BLOCKLIST)
+        )
+
+    except anthropic.APIError as exc:
+        log.error("Erreur Claude API (message #%d) : %s", message_id, exc)
+    except Exception as exc:
+        log.error("Erreur inattendue (message #%d) : %s", message_id, exc, exc_info=True)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    global _http_session
+
+    await db.init_db()
+
+    _http_session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=20))
+
+    await userbot.start()
+    await bot.start(bot_token=BOT_TOKEN)
+
+    me = await userbot.get_me()
+    log.info("Userbot connecté : %s (@%s)", me.first_name, me.username)
+    log.info(
+        "Écoute du groupe %d → privé %d / public %d",
+        SOURCE_GROUP, CHANNEL_PRIVATE, CHANNEL_PUBLIC,
+    )
+
+    # Disclaimer — posté une seule fois
+    if not await db.get_app_state("disclaimer_sent"):
+        for ch in ALL_CHANNELS:
+            try:
+                await bot.send_message(ch, DISCLAIMER, parse_mode="md")
+            except Exception as exc:
+                log.warning("Disclaimer canal %d : %s", ch, exc)
+        await db.set_app_state("disclaimer_sent", "1")
+        log.info("Disclaimer posté — épinglez-le manuellement dans chaque canal.")
+
+    asyncio.create_task(tracker.run_polling_loop(bot, ALL_CHANNELS, _http_session))
+    asyncio.create_task(scheduler.run_weekly_scheduler(bot, ALL_CHANNELS, _http_session))
+
+    try:
+        await userbot.run_until_disconnected()
+    finally:
+        await _http_session.close()
 
 
 if __name__ == "__main__":
