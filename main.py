@@ -113,7 +113,11 @@ Réponds uniquement par un seul mot parmi : signal, analyse, autre.
             ou tout message principalement auto-promotionnel — vantardise sur des calls passés,
             attribution de performance ("nous avions prévu", "notre analyse a touché le TP",
             "ceux qui nous suivent", "communiqué en amont", "notre track record",
-            "la performance parle d'elle-même", "abonnez-vous", "rejoignez notre groupe").\
+            "la performance parle d'elle-même", "abonnez-vous", "rejoignez notre groupe"),
+            ou tout message qui renvoie à un graphique pour les niveaux de prix
+            ("voir le graphique", "check the chart", "on the chart", "see chart",
+            "as shown on chart", "cf. graphique", etc.) sans inclure de valeurs numériques
+            concrètes (prix, pourcentages, niveaux chiffrés) dans le texte lui-même.\
 """
 
 _SIGNAL_SYS = """\
@@ -277,6 +281,11 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
     if not text:
         return
 
+    # Filtre pré-classification : image sans données numériques dans le texte
+    if event.message.photo is not None and not re.search(r'\d', text):
+        log.info("Message #%d — Signal image sans données texte — ignoré.", message_id)
+        return
+
     # Layer 1 — blocklist sur le texte source brut
     if SOURCE_BLOCKLIST:
         hit = _blocklist_hit(text)
@@ -307,7 +316,13 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
             suffix    = ""
 
             signal_data = await extract_signal(text)
-            if signal_data and _http_session:
+
+            # Filtre post-extraction : rejette les signaux sans niveaux concrets
+            if signal_data is None or (not signal_data.get("entry1") and not signal_data.get("targets")):
+                log.info("Message #%d — Signal sans niveaux concrets — non publié.", message_id)
+                return
+
+            if _http_session:
                 symbol = await binance_api.resolve_symbol(
                     signal_data["asset"], _http_session
                 )
@@ -327,8 +342,6 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
                 else:
                     suffix = f"\n\n📡 _Suivi non disponible ({signal_data['asset']} introuvable sur Binance)_"
                     log.info("Symbole %s introuvable sur Binance.", signal_data["asset"])
-            elif not signal_data:
-                log.info("Extraction incertaine — signal posté sans suivi.")
 
             formatted += suffix
 
