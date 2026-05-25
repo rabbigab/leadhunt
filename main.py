@@ -39,6 +39,7 @@ import binance_api
 import db
 import scheduler
 import tracker
+import x_poster
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -343,6 +344,7 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
 
         for ch in ALL_CHANNELS:
             await _send_with_retry(ch, formatted)
+        await x_poster.post_to_x(formatted, claude, SOURCE_BLOCKLIST)
         log.info("Publié sur %d canaux (%s).", len(ALL_CHANNELS), msg_type.value)
 
     except anthropic.APIError as exc:

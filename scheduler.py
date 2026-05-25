@@ -8,6 +8,7 @@ import aiohttp
 
 import binance_api
 import db
+import x_poster
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ def _seconds_until_next_monday_9am() -> float:
     return max(0.0, (next_run - now).total_seconds())
 
 
-async def _build_report(session: aiohttp.ClientSession) -> str:
+async def _build_report(session: aiohttp.ClientSession):
     since       = datetime.utcnow() - timedelta(days=7)
     closed      = await db.get_closed_trades_since(since)
     open_trades = await db.get_open_trades()
@@ -75,6 +76,8 @@ async def _build_report(session: aiohttp.ClientSession) -> str:
                 lines.append(f"• *{t['asset']}* {d} | Entrée {ep}")
 
     # ── Statistiques ──────────────────────────────────────────────────────────
+    gains: list[float] = []
+    losses: list[float] = []
     if counted:
         gains  = [t["pnl_pct"] for t in counted if t["pnl_pct"] is not None and t["pnl_pct"] >= 0]
         losses = [t["pnl_pct"] for t in counted if t["pnl_pct"] is not None and t["pnl_pct"] < 0]
@@ -89,7 +92,7 @@ async def _build_report(session: aiohttp.ClientSession) -> str:
         lines.append("\n_Aucun trade clôturé cette semaine._")
 
     lines.append("\n_Suivi automatique sur paires Binance — pas un conseil en investissement_")
-    return "\n".join(lines)
+    return "\n".join(lines), counted, gains, losses
 
 
 async def run_weekly_scheduler(
@@ -100,10 +103,11 @@ async def run_weekly_scheduler(
     await asyncio.sleep(delay)
     while True:
         try:
-            report = await _build_report(session)
+            report, counted, gains, losses = await _build_report(session)
             for ch in channels:
                 await bot.send_message(ch, report, parse_mode="md")
             log.info("Rapport hebdomadaire posté.")
+            await x_poster.post_weekly_summary_to_x(counted, gains, losses)
         except Exception as exc:
             log.error("Erreur rapport hebdomadaire : %s", exc)
         await asyncio.sleep(7 * 24 * 3600)
