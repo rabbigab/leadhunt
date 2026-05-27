@@ -283,7 +283,7 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
 
     # Filtre pré-classification : image sans données numériques dans le texte
     if event.message.photo is not None and not re.search(r'\d', text):
-        log.info("Message #%d — Signal image sans données texte — ignoré.", message_id)
+        log.info("Message #%d — image sans données numériques — ignoré.", message_id)
         return
 
     # Layer 1 — blocklist sur le texte source brut
@@ -316,13 +316,7 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
             suffix    = ""
 
             signal_data = await extract_signal(text)
-
-            # Filtre post-extraction : rejette les signaux sans niveaux concrets
-            if signal_data is None or (not signal_data.get("entry1") and not signal_data.get("targets")):
-                log.info("Message #%d — Signal sans niveaux concrets — non publié.", message_id)
-                return
-
-            if _http_session:
+            if signal_data and _http_session:
                 symbol = await binance_api.resolve_symbol(
                     signal_data["asset"], _http_session
                 )
@@ -342,6 +336,8 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
                 else:
                     suffix = f"\n\n📡 _Suivi non disponible ({signal_data['asset']} introuvable sur Binance)_"
                     log.info("Symbole %s introuvable sur Binance.", signal_data["asset"])
+            elif not signal_data:
+                log.info("Extraction incertaine — signal posté sans suivi.")
 
             formatted += suffix
 
@@ -357,8 +353,11 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
 
         for ch in ALL_CHANNELS:
             await _send_with_retry(ch, formatted)
-        await x_poster.post_to_x(formatted, claude, SOURCE_BLOCKLIST)
         log.info("Publié sur %d canaux (%s).", len(ALL_CHANNELS), msg_type.value)
+
+        asyncio.create_task(
+            x_poster.post_to_x(formatted, claude, SOURCE_BLOCKLIST)
+        )
 
     except anthropic.APIError as exc:
         log.error("Erreur Claude API (message #%d) : %s", message_id, exc)
