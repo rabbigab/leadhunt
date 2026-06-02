@@ -90,7 +90,7 @@ async def post_to_x(
 
         tweet = _fit(teaser)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: client.create_tweet(text=tweet))
         log.info("Posté sur X (%d car.).", len(tweet))
 
@@ -132,7 +132,7 @@ async def post_weekly_summary_to_x(
 
         tweet = _fit(body)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: client.create_tweet(text=tweet))
         log.info("Résumé hebdo posté sur X.")
 
